@@ -25,7 +25,7 @@ MIN_OPTION_PRICE = 0.5
 MIN_DAYS_TO_EXPIRY = 3
 MAX_RETRIES = 3
 RETRY_SLEEP = 3
-TRADE_INTERVAL_MINUTES = 30  # mimic QCAlgorithm 30-min schedule
+TRADE_INTERVAL_MINUTES = 30
 
 # Scheduler times
 DAILY_REFRESH_TIME = "09:45"
@@ -45,7 +45,19 @@ purchased_options = set()
 # -------------------------
 # HELPERS
 # -------------------------
+def is_market_open() -> bool:
+    """Return True if market is currently open."""
+    try:
+        clock = api.get_clock()
+        return clock.is_open
+    except Exception as e:
+        print(f"[ClockError] Could not get market status: {e}")
+        return False
+
 def safe_get_bars(symbol: str, timeframe: TimeFrame, limit: int = 5):
+    if not is_market_open():
+        print(f"[MarketClosed] Skipping get_bars for {symbol}")
+        return None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             bars = api.get_bars(symbol, timeframe, limit=limit).df
@@ -56,6 +68,9 @@ def safe_get_bars(symbol: str, timeframe: TimeFrame, limit: int = 5):
     return None
 
 def safe_get_option_contracts(symbol: str):
+    if not is_market_open():
+        print(f"[MarketClosed] Skipping get_options_contracts for {symbol}")
+        return []
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return api.get_options_contracts(symbol)
@@ -68,6 +83,9 @@ def safe_get_option_contracts(symbol: str):
 # UNIVERSE SELECTION
 # -------------------------
 def get_universe() -> List[str]:
+    if not is_market_open():
+        print("[MarketClosed] Skipping universe selection")
+        return []
     selected = []
     try:
         assets = api.list_assets(status="active")
@@ -102,6 +120,9 @@ def get_universe() -> List[str]:
 # OPTION SELECTION
 # -------------------------
 def choose_atm_call_put(symbol: str):
+    if not is_market_open():
+        print(f"[MarketClosed] Skipping option selection for {symbol}")
+        return None, None, None
     try:
         contracts = safe_get_option_contracts(symbol)
         if not contracts:
@@ -154,6 +175,9 @@ def choose_atm_call_put(symbol: str):
 # TRADING LOGIC
 # -------------------------
 def trade_logic():
+    if not is_market_open():
+        print("[MarketClosed] Skipping trade logic")
+        return
     try:
         account = api.get_account()
         cash = float(account.cash)
@@ -203,6 +227,9 @@ def trade_logic():
 # RISK MANAGEMENT
 # -------------------------
 def manage_risk():
+    if not is_market_open():
+        print("[MarketClosed] Skipping risk management")
+        return
     try:
         positions = api.list_positions()
     except Exception as e:
@@ -257,10 +284,3 @@ if __name__=="__main__":
     except Exception as e:
         print(f"[StartupError] {e}")
 
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(1)
-        except Exception as e:
-            print(f"[SchedulerError] {e}")
-            time.sleep(5)
