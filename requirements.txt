@@ -1,1 +1,3 @@
-
+alpaca-trade-api
+pandas
+schedule
