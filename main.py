@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Dynamic Options Swing (Alpaca) - Paper Trading with Hardcoded Universe
-Fully integrated version: ATM option selection, trading, risk management, Discord notifications
+Fully integrated version: ATM option selection, trading, risk management, heartbeat, Discord notifications
 """
 import os
 import sys
@@ -293,15 +293,25 @@ def manage_risk():
             print(f"[RiskError] {pos.symbol}: {e}")
 
 # -------------------------
+# HEARTBEAT
+# -------------------------
+def send_heartbeat():
+    msg = f"💓 Heartbeat: Bot running at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}"
+    print(f"[Heartbeat] {msg}")
+    send_discord_message(msg)
+
+# -------------------------
 # SCHEDULER
 # -------------------------
 schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(trade_logic)
 schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(manage_risk)
+schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(send_heartbeat)
 
 def run_scheduler():
     print(f"🚀 Dynamic Options Swing (Alpaca) started {datetime.now(timezone.utc)}")
     trade_logic()
     manage_risk()
+    send_heartbeat()
     while True:
         try:
             schedule.run_pending()
@@ -315,3 +325,4 @@ def run_scheduler():
 
 if __name__ == "__main__":
     run_scheduler()
+
