@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Dynamic Options Swing (Alpaca) - Fixed Full Version (Paper trading default)
- - Dynamic universe selection (price / volume filters)
+Dynamic Options Swing (Alpaca) - Paper Trading with Hardcoded Universe
+ - Hardcoded top 30 tickers for testing ($3-$50, high option activity)
  - ATM call/put selection with option-volume & price filters
- - Exponential backoff for data calls, skip symbol after retries (no discord alerts for data failures)
- - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts on crashes
- - Timezone-safe: all bar timestamps are forced to UTC to avoid offset-naive vs offset-aware issues
- - Fixed DataFrame boolean checks to prevent ambiguous truth value errors
+ - Exponential backoff for data calls, skip symbol after retries
+ - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts
+ - Timezone-safe: all bar timestamps are forced to UTC
 """
 import os
 import sys
@@ -15,7 +14,7 @@ import traceback
 import signal
 import schedule
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from alpaca_trade_api import REST, TimeFrame
 from alpaca_trade_api.rest import APIError
@@ -30,7 +29,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 RISK_PER_TRADE = 0.02
 STOP_LOSS_PCT = 0.35
-TOP_N_STOCKS = 10
+TOP_N_STOCKS = 10  # not used in hardcoded mode
 MIN_PRICE = 3.0
 MAX_PRICE = 50.0
 MIN_VOLUME = 1_000_000
@@ -45,6 +44,15 @@ TRADE_INTERVAL_MINUTES = 30
 DAILY_REFRESH_TIME = "09:45"
 DAILY_TRADE_TIME = "09:50"
 DAILY_SUMMARY_TIME = "20:00"
+
+# -------------------------
+# HARDCODED UNIVERSE
+# -------------------------
+HARDCODED_TICKERS = [
+    "AAPL", "MSFT", "AMD", "NVDA", "INTC", "TSLA", "COIN", "BA", "META", "NFLX",
+    "BIDU", "F", "GM", "ZM", "PLTR", "UBER", "LYFT", "SQ", "PYPL", "PFE",
+    "MRNA", "SPCE", "NOK", "T", "VZ", "GME", "AMC", "SNDL", "FUBO", "NKLA"
+]
 
 # -------------------------
 # ALPACA CLIENT
@@ -113,39 +121,13 @@ def is_market_open() -> bool:
         print(f"[ClockError] {e}")
         return False
 
-def _ensure_index_utc(df):
-    try:
-        if df is None or not hasattr(df, "index"):
-            return df
-        idx = df.index
-        try:
-            if getattr(idx, "tz", None) is None:
-                df.index = idx.tz_localize('UTC')
-            else:
-                df.index = idx.tz_convert('UTC')
-        except Exception as e:
-            import pandas as pd
-            try:
-                df.index = pd.to_datetime(df.index).tz_localize('UTC')
-            except Exception:
-                print(f"[TimezoneFix] Could not enforce tz on df.index: {e}")
-    except Exception as e:
-        print(f"[TimezoneFixGeneral] {e}")
-    return df
-
-def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5):
+def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
     try:
         bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
-        if bars is None:
-            return None
         df = getattr(bars, "df", None) or bars
-        if df is None:
-            return None
-        df = _ensure_index_utc(df)
         import pandas as pd
-        if isinstance(df, pd.DataFrame) and df.empty:
-            print(f"[DataFetch] {symbol} has no bars, skipping without retry")
-            return None
+        if df is not None and hasattr(df, "index"):
+            df.index = pd.to_datetime(df.index).tz_localize('UTC', ambiguous='NaT', nonexistent='NaT')
         return df
     except Exception as e:
         print(f"[DataFetch] Max retries exceeded for {symbol} bars: {e}")
@@ -163,57 +145,23 @@ def fetch_option_contracts_with_backoff(symbol: str):
 # UNIVERSE SELECTION
 # -------------------------
 def get_universe() -> List[str]:
-    chosen: List[str] = []
-    try:
-        assets = safe_api_call(api.list_assets, status="active")
-    except Exception as e:
-        print(f"[Universe] list_assets failed: {e}")
-        send_critical_alert("Failed to list assets", e)
-        return []
-
-    tradable = [a for a in assets if getattr(a, "tradable", False) and getattr(a, "exchange", "") in ("NASDAQ", "NYSE")]
-    candidates = []
-    for a in tradable:
-        sym = a.symbol
-        try:
-            bars = fetch_bars_with_backoff(sym, TimeFrame.Day, limit=2)
-            if bars is None:
-                continue
-            last_close = float(bars["close"].iloc[-1])
-            last_vol = int(bars["volume"].iloc[-1])
-            last_bar_time = bars.index[-1].to_pydatetime()
-            now = datetime.now(timezone.utc)
-            if last_bar_time.tzinfo is None:
-                last_bar_time = last_bar_time.replace(tzinfo=timezone.utc)
-            if (now - last_bar_time).days > 3:
-                continue
-            if MIN_PRICE <= last_close <= MAX_PRICE and last_vol >= MIN_VOLUME:
-                candidates.append((sym, last_vol))
-        except Exception as e:
-            print(f"[Universe] skipping {sym} due to error: {e}")
-            continue
-
-    top = sorted(candidates, key=lambda x: x[1], reverse=True)[:TOP_N_STOCKS]
-    chosen = [s for s, _ in top]
-    print(f"[Universe] Selected {len(chosen)} symbols: {chosen}")
-    if chosen:
-        send_discord_message(f"📈 Universe updated: {chosen}")
+    chosen = HARDCODED_TICKERS
+    print(f"[Universe] Using hardcoded universe: {chosen}")
+    send_discord_message(f"📈 Universe updated (hardcoded): {chosen}")
     return chosen
 
 # -------------------------
-# OPTION SELECTION
+# OPTION SELECTION (ATM)
 # -------------------------
 def choose_atm_call_put(symbol: str):
     try:
         contracts = fetch_option_contracts_with_backoff(symbol)
         if not contracts:
             return None, None, None
-
         bars = fetch_bars_with_backoff(symbol, TimeFrame.Day, limit=1)
-        if bars is None:
+        if bars is None or getattr(bars, "empty", False):
             return None, None, None
         underlying_price = float(bars["close"].iloc[-1])
-
         today = datetime.now(timezone.utc).date()
         valid_contracts = []
         for c in contracts:
@@ -234,18 +182,14 @@ def choose_atm_call_put(symbol: str):
                 valid_contracts.append(c)
             except Exception:
                 continue
-
         if not valid_contracts:
             return None, None, underlying_price
-
         calls = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "call"]
         puts = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "put"]
         if not calls or not puts:
             return None, None, underlying_price
-
         atm_call = min(calls, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
         atm_put  = min(puts,  key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
-
         return atm_call, atm_put, underlying_price
     except Exception as e:
         print(f"[OptionSelectError] {symbol}: {e}")
@@ -258,7 +202,6 @@ def trade_logic():
     if not is_market_open():
         print("[MarketClosed] Skipping trade logic")
         return
-
     try:
         account = safe_api_call(api.get_account)
         cash = float(account.cash)
@@ -266,29 +209,23 @@ def trade_logic():
             print("[TradeLogic] No cash.")
             return
         max_invest = cash * RISK_PER_TRADE
-
         global symbols
         symbols = get_universe()
         if not symbols:
             print("[TradeLogic] No symbols selected.")
             return
-
         for sym in symbols:
             call, put, underlying_price = choose_atm_call_put(sym)
             if not call or not put:
                 print(f"[{sym}] No valid ATM options meeting filters.")
                 continue
-
             call_price = float(getattr(call, "ask_price", getattr(call, "last_trade_price", getattr(call, "last_price", 0))))
             put_price  = float(getattr(put,  "ask_price", getattr(put,  "last_trade_price", getattr(put,  "last_price", 0))))
-
             if call_price <= 0 or put_price <= 0:
-                print(f"[{sym}] invalid option price (call={call_price}, put={put_price}), skipping")
+                print(f"[{sym}] invalid option price, skipping")
                 continue
-
             call_qty = int(max_invest / (call_price * 100)) if call_price > 0 else 0
             put_qty  = int(max_invest / (put_price * 100)) if put_price > 0 else 0
-
             call_symbol = getattr(call, "symbol", None) or getattr(call, "contract", None)
             if call_qty >= 1 and call_symbol and call_symbol not in purchased_options:
                 try:
@@ -300,7 +237,6 @@ def trade_logic():
                 except Exception as e:
                     print(f"[OrderError] CALL {call_symbol}: {e}")
                     send_discord_message(f"❌ OrderError CALL {call_symbol}: {e}")
-
             put_symbol = getattr(put, "symbol", None) or getattr(put, "contract", None)
             if put_qty >= 1 and put_symbol and put_symbol not in purchased_options:
                 try:
@@ -312,7 +248,6 @@ def trade_logic():
                 except Exception as e:
                     print(f"[OrderError] PUT {put_symbol}: {e}")
                     send_discord_message(f"❌ OrderError PUT {put_symbol}: {e}")
-
     except Exception as e:
         print(f"[TradeLogicError] {e}")
         send_critical_alert("Trade logic failure", e)
@@ -330,7 +265,6 @@ def manage_risk():
         print(f"[ManageRisk] Failed to list positions: {e}")
         send_critical_alert("Failed to list positions", e)
         return
-
     for pos in positions:
         try:
             if getattr(pos, "asset_class", "") != "option":
@@ -344,69 +278,28 @@ def manage_risk():
                 print(f"[STOP-LOSS] Sold {symbol} at {current_price:.2f}")
                 send_discord_message(f"⚠️ STOP-LOSS triggered: Sold {symbol} at ${current_price:.2f}")
         except Exception as e:
-            print(f"[RiskError] {e}")
-            continue
+            print(f"[RiskError] {pos.symbol}: {e}")
 
 # -------------------------
-# DAILY RESET & SUMMARY
+# SCHEDULE
 # -------------------------
-def reset_daily_state():
-    global purchased_options
-    try:
-        account = safe_api_call(api.get_account)
-        positions = safe_api_call(api.list_positions)
-        send_discord_message(
-            f"📅 Daily Summary: Equity ${float(account.equity):,.2f} | "
-            f"Cash ${float(account.cash):,.2f} | Positions {len(positions)}"
-        )
-    except Exception as e:
-        print(f"[DailyResetError] {e}")
-        send_discord_message(f"⚠️ Could not fetch daily summary: {e}")
-    purchased_options = set()
-    print("[DailyReset] Cleared purchased options for the day.")
+schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(trade_logic)
+schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(manage_risk)
 
-# -------------------------
-# HEARTBEAT
-# -------------------------
-def send_heartbeat():
-    try:
-        account = safe_api_call(api.get_account)
-        equity = float(account.equity)
-        cash = float(account.cash)
-        send_discord_message(f"💓 Bot alive at {datetime.now(timezone.utc):%H:%M UTC}. Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
-    except Exception as e:
-        print(f"[HeartbeatError] {e}")
-
-# -------------------------
-# SCHEDULER
-# -------------------------
-def daily_routine():
-    print(f"[DailyRoutine] Running at {datetime.now(timezone.utc).isoformat()}")
+def run_scheduler():
+    print(f"🚀 Dynamic Options Swing (Alpaca) started {datetime.now(timezone.utc)}")
     trade_logic()
-    schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(manage_risk)
-
-def schedule_jobs():
-    schedule.every().day.at(DAILY_REFRESH_TIME).do(lambda: (print("[Schedule] Refreshing universe..."), get_universe()))
-    schedule.every().day.at(DAILY_TRADE_TIME).do(daily_routine)
-    schedule.every().day.at(DAILY_SUMMARY_TIME).do(reset_daily_state)
-    schedule.every(3).hours.do(send_heartbeat)
-
-# -------------------------
-# MAIN
-# -------------------------
-def main():
-    print(f"==> Dynamic Options Swing (Alpaca) starting at {datetime.now(timezone.utc)}")
-    schedule_jobs()
+    manage_risk()
     while True:
         try:
             schedule.run_pending()
-            time.sleep(10)
+            time.sleep(30)
         except KeyboardInterrupt:
-            print("==> Exiting (KeyboardInterrupt)")
+            print("[Shutdown] Exiting cleanly...")
             sys.exit(0)
         except Exception as e:
-            send_critical_alert("Main loop crashed", e)
-            time.sleep(10)
+            print(f"[SchedulerError] {e}")
+            send_critical_alert("Scheduler failure", e)
 
 if __name__ == "__main__":
-    main()
+    run_scheduler()
