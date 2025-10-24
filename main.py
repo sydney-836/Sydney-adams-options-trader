@@ -1,4 +1,4 @@
-print("API_KEY:", API_KEY, "API_SECRET:", API_SECRET, "BASE_URL:", BASE_URL)
+
 import os
 import time
 import schedule
