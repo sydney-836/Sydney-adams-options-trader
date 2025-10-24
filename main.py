@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Dynamic Options Swing (Alpaca) with Discord notifications
+Dynamic Options Swing (Alpaca) - Final (Paper trading default)
  - Dynamic universe selection (price / volume filters)
  - ATM call/put selection with option-volume & price filters
- - Exponential backoff for data calls, skip symbol after retries (no Discord alerts for data failures)
+ - Exponential backoff for data calls, skip symbol after retries (no discord alerts for data failures)
  - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts on crashes
- - Safe retry wrapper for Alpaca calls
+ - Timezone-safe: all bar timestamps are forced to UTC to avoid offset-naive vs offset-aware issues
 """
 import os
 import sys
@@ -14,16 +14,17 @@ import traceback
 import signal
 import schedule
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from alpaca_trade_api import REST, TimeFrame
 from alpaca_trade_api.rest import APIError
 
 # -------------------------
-# CONFIGURATION (tweakable)
+# CONFIGURATION
 # -------------------------
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+# Paper trading by default:
 BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
@@ -86,7 +87,7 @@ def send_critical_alert(title: str, exc: Optional[BaseException] = None) -> None
         else:
             tb = "".join(traceback.format_stack())
             trace = f"\n```{tb[-1800:]}```"
-        send_discord_message(f"🔥 CRITICAL: {title} at {datetime.now():%Y-%m-%d %H:%M:%S}{trace}", critical=True)
+        send_discord_message(f"🔥 CRITICAL: {title} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}{trace}", critical=True)
     except Exception as e:
         print(f"[CriticalAlertError] {e}")
 
@@ -95,7 +96,7 @@ def send_critical_alert(title: str, exc: Optional[BaseException] = None) -> None
 # -------------------------
 def safe_api_call(fn, *args, max_retries=MAX_RETRIES, initial_sleep=INITIAL_RETRY_SLEEP, **kwargs):
     """
-    Generic safe wrapper with exponential backoff.
+    Generic safe wrapper with exponential backoff and slightly increasing delays to reduce spam.
     Raises the last exception if all retries fail.
     """
     sleep = initial_sleep
@@ -103,17 +104,16 @@ def safe_api_call(fn, *args, max_retries=MAX_RETRIES, initial_sleep=INITIAL_RETR
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            # Don't spam Discord for transient data fetch failures;
-            # only print here. Critical alerts managed by callers when appropriate.
+            # Print a concise message; avoid extremely frequent console spam
             print(f"[Retry {attempt}/{max_retries}] {fn.__name__} failed: {e}")
             if attempt == max_retries:
                 raise
-            time.sleep(sleep)
-            print(f"[Retry] sleeping {sleep}s before next attempt for {fn.__name__}...")
+            # Backoff with small increase and jitter
+            time.sleep(sleep + attempt)  # slightly larger step each retry
             sleep *= 2
 
 # -------------------------
-# MARKET STATUS / DATA HELPERS
+# MARKET STATUS / DATA HELPERS (timezone-safe)
 # -------------------------
 def is_market_open() -> bool:
     """Return True if market is open (uses safe_api_call)."""
@@ -127,18 +127,59 @@ def is_market_open() -> bool:
         print(f"[ClockError] {e}")
         return False
 
+def _ensure_index_utc(df):
+    """Ensure the dataframe index (timestamps) are timezone-aware and in UTC."""
+    # Many alpaca client returns pandas DataFrame with DatetimeIndex possibly tz-naive
+    try:
+        if df is None:
+            return df
+        if hasattr(df, "index"):
+            idx = df.index
+            # If tz is None -> localize to UTC. If tz exists -> convert to UTC.
+            try:
+                if getattr(idx, "tz", None) is None:
+                    df.index = idx.tz_localize('UTC')
+                else:
+                    df.index = idx.tz_convert('UTC')
+            except Exception as e:
+                # Some index types may not support tz_localize; fall back to explicit timestamps
+                try:
+                    df.index = pd.to_datetime(df.index).tz_localize('UTC')
+                except Exception:
+                    print(f"[TimezoneFix] Could not enforce tz on df.index: {e}")
+    except Exception as e:
+        print(f"[TimezoneFixGeneral] {e}")
+    return df
+
 def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
     """
     Fetch bars (returns dataframe-like object when available).
     If fails after retries, returns None (no Discord alert here per user request).
     """
     try:
-        # safe_api_call will raise if all retries fail
         bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
-        # .df may exist depending on the alpaca client version
-        if hasattr(bars, "df"):
-            return bars.df
-        return bars
+        # normalize to DataFrame where possible
+        df = getattr(bars, "df", None) or bars
+        # ensure tz safety
+        if df is not None and hasattr(df, "index"):
+            # local import for pandas only if needed to avoid import errors earlier
+            import pandas as pd  # local import is fine
+            try:
+                idx = pd.to_datetime(df.index)
+                if getattr(idx, "tz", None) is None:
+                    df.index = idx.tz_localize('UTC')
+                else:
+                    df.index = idx.tz_convert('UTC')
+            except Exception as e:
+                # fallback: try df.index.tz_localize if present
+                try:
+                    if getattr(df.index, "tz", None) is None:
+                        df.index = df.index.tz_localize('UTC')
+                    else:
+                        df.index = df.index.tz_convert('UTC')
+                except Exception:
+                    print(f"[Timezone] could not normalize index for {symbol}: {e}")
+        return df
     except Exception as e:
         print(f"[DataFetch] Max retries exceeded for {symbol} bars: {e}")
         return None
@@ -177,19 +218,24 @@ def get_universe() -> List[str]:
         sym = a.symbol
         try:
             bars = fetch_bars_with_backoff(sym, TimeFrame.Day, limit=2)
-            if bars is None or bars.empty:
+            if bars is None or getattr(bars, "empty", False):
                 continue
             # Use last close & last volume
             last_close = float(bars["close"].iloc[-1])
             last_vol = int(bars["volume"].iloc[-1])
-            # exclude stale data
+            # ensure last bar timestamp is timezone-aware and compare against UTC now
             last_bar_time = bars.index[-1].to_pydatetime()
-            if (datetime.now() - last_bar_time).days > 3:
+            now = datetime.now(timezone.utc)
+            # if last_bar_time is tz-naive, localize to UTC
+            if last_bar_time.tzinfo is None:
+                # convert to tz-aware assuming UTC (bars we received likely are UTC)
+                last_bar_time = last_bar_time.replace(tzinfo=timezone.utc)
+            if (now - last_bar_time).days > 3:
                 continue
             if MIN_PRICE <= last_close <= MAX_PRICE and last_vol >= MIN_VOLUME:
                 candidates.append((sym, last_vol))
         except Exception as e:
-            # per-symbol issues: skip quietly (no Discord alert)
+            # per-symbol issues: skip quietly (user requested no discord for data failures)
             print(f"[Universe] skipping {sym} due to error: {e}")
             continue
 
@@ -197,7 +243,6 @@ def get_universe() -> List[str]:
     top = sorted(candidates, key=lambda x: x[1], reverse=True)[:TOP_N_STOCKS]
     chosen = [s for s, _ in top]
     print(f"[Universe] Selected {len(chosen)} symbols: {chosen}")
-    # Inform Discord of updated universe (not for data failures)
     if chosen:
         send_discord_message(f"📈 Universe updated: {chosen}")
     return chosen
@@ -216,15 +261,14 @@ def choose_atm_call_put(symbol: str):
             return None, None, None
 
         bars = fetch_bars_with_backoff(symbol, TimeFrame.Day, limit=1)
-        if bars is None or bars.empty:
+        if bars is None or getattr(bars, "empty", False):
             return None, None, None
         underlying_price = float(bars["close"].iloc[-1])
 
-        today = datetime.now().date()
+        today = datetime.now(timezone.utc).date()
         valid_contracts = []
         for c in contracts:
             try:
-                # many Alpaca option objects use attributes like expiration_date, strike_price, option_type, volume, last_trade_price
                 exp_str = getattr(c, "expiration_date", None) or getattr(c, "expiration", None)
                 if not exp_str:
                     continue
@@ -251,7 +295,7 @@ def choose_atm_call_put(symbol: str):
             return None, None, underlying_price
 
         atm_call = min(calls, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
-        atm_put = min(puts,  key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
+        atm_put  = min(puts,  key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
 
         return atm_call, atm_put, underlying_price
     except Exception as e:
@@ -373,7 +417,6 @@ def reset_daily_state():
             f"Cash ${float(account.cash):,.2f} | Positions {len(positions)}"
         )
     except Exception as e:
-        # user asked: no discord alerts for data fetch fails — but daily summary is allowed.
         print(f"[DailyResetError] {e}")
         send_discord_message(f"⚠️ Could not fetch daily summary: {e}")
     purchased_options = set()
@@ -387,7 +430,7 @@ def send_heartbeat():
         account = safe_api_call(api.get_account)
         equity = float(account.equity)
         cash = float(account.cash)
-        send_discord_message(f"💓 Bot alive at {datetime.now():%H:%M}. Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
+        send_discord_message(f"💓 Bot alive at {datetime.now(timezone.utc):%H:%M UTC}. Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
     except Exception as e:
         print(f"[HeartbeatError] {e}")
         # don't spam discord if account fetch fails repeatedly
@@ -396,7 +439,7 @@ def send_heartbeat():
 # SCHEDULER
 # -------------------------
 def daily_routine():
-    print(f"[DailyRoutine] Running at {datetime.now()}")
+    print(f"[DailyRoutine] Running at {datetime.now(timezone.utc).isoformat()}")
     trade_logic()
     # schedule risk management every TRADE_INTERVAL_MINUTES from now
     schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(manage_risk)
@@ -435,9 +478,9 @@ sys.excepthook = excepthook
 # MAIN
 # -------------------------
 if __name__ == "__main__":
-    print("🚀 Dynamic Options Swing (Alpaca) started", datetime.now())
+    print("🚀 Dynamic Options Swing (Alpaca) started", datetime.now(timezone.utc).isoformat())
     try:
-        send_discord_message(f"🚀 Bot started at {datetime.now():%Y-%m-%d %H:%M}")
+        send_discord_message(f"🚀 Bot started at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}")
     except Exception:
         print("[Startup] Discord start message failed (webhook missing or network)")
 
@@ -463,3 +506,4 @@ if __name__ == "__main__":
     except Exception as final_exc:
         send_critical_alert("Fatal error in main loop", final_exc)
         raise
+
