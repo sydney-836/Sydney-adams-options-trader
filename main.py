@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Dynamic Options Swing (Alpaca) - Fixed Full Version
- - Dynamic universe selection (price/volume filters)
+Dynamic Options Swing (Alpaca) - Paper Trading
+ - Dynamic universe selection (price / volume filters)
  - ATM call/put selection with option-volume & price filters
- - Exponential backoff for data calls, skip symbol after retries
- - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts
- - Timezone-safe: all bar timestamps are forced to UTC (avoids offset-naive/aware issues)
- - Fixed DataFrame ambiguity issues
+ - Skip tickers with no bars or preferred share suffixes
+ - Discord: heartbeats, trade updates, stop-loss, daily summary
+ - Timezone-safe: all bar timestamps forced to UTC
 """
 import os
 import sys
@@ -28,7 +27,7 @@ API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Trading settings
+# Universe & option filters
 RISK_PER_TRADE = 0.02
 STOP_LOSS_PCT = 0.35
 TOP_N_STOCKS = 10
@@ -58,14 +57,14 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # STATE
 # -------------------------
 symbols: List[str] = []
-purchased_options = set()  # track option symbols bought today
+purchased_options = set()
 
 # -------------------------
 # DISCORD HELPERS
 # -------------------------
 def send_discord_message(message: str, critical: bool = False) -> None:
     if not DISCORD_WEBHOOK_URL:
-        print("[Discord] webhook not set, skipping message")
+        print("[Discord] webhook not set; skipping message.")
         return
     payload = {"content": ("@here\n" if critical else "") + message}
     try:
@@ -76,17 +75,14 @@ def send_discord_message(message: str, critical: bool = False) -> None:
         print(f"[Discord] send error: {e}")
 
 def send_critical_alert(title: str, exc: Optional[BaseException] = None) -> None:
-    try:
-        trace = ""
-        if exc:
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            trace = f"\n```{tb[-1800:]}```"
-        else:
-            tb = "".join(traceback.format_stack())
-            trace = f"\n```{tb[-1800:]}```"
-        send_discord_message(f"🔥 CRITICAL: {title} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}{trace}", critical=True)
-    except Exception as e:
-        print(f"[CriticalAlertError] {e}")
+    trace = ""
+    if exc:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        trace = f"\n```{tb[-1800:]}```"
+    else:
+        tb = "".join(traceback.format_stack())
+        trace = f"\n```{tb[-1800:]}```"
+    send_discord_message(f"🔥 CRITICAL: {title} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}{trace}", critical=True)
 
 # -------------------------
 # SAFE API CALLS / BACKOFF
@@ -116,18 +112,23 @@ def is_market_open() -> bool:
         print(f"[ClockError] {e}")
         return False
 
-def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5):
-    import pandas as pd
+def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
     try:
+        # Skip tickers with unusual suffixes like preferred shares
+        if "." in symbol and symbol.split(".")[1].startswith("P"):
+            print(f"[Universe] Skipping preferred/security ticker {symbol}")
+            return None
         bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
         df = getattr(bars, "df", bars)
-        if df is None or df.empty:
+        if df is None or getattr(df, "empty", True):
+            print(f"[DataFetch] {symbol} has no bars, skipping without retry")
             return None
-        idx = pd.to_datetime(df.index)
-        if getattr(idx, "tz", None) is None:
-            df.index = idx.tz_localize('UTC')
+        import pandas as pd
+        df.index = pd.to_datetime(df.index)
+        if getattr(df.index, "tz", None) is None:
+            df.index = df.index.tz_localize('UTC')
         else:
-            df.index = idx.tz_convert('UTC')
+            df.index = df.index.tz_convert('UTC')
         return df
     except Exception as e:
         print(f"[DataFetch] Max retries exceeded for {symbol} bars: {e}")
@@ -135,8 +136,7 @@ def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5):
 
 def fetch_option_contracts_with_backoff(symbol: str):
     try:
-        contracts = safe_api_call(api.get_options_contracts, symbol)
-        return contracts
+        return safe_api_call(api.get_options_contracts, symbol)
     except Exception as e:
         print(f"[DataFetch] Max retries exceeded for {symbol} option contracts: {e}")
         return None
@@ -145,7 +145,7 @@ def fetch_option_contracts_with_backoff(symbol: str):
 # UNIVERSE SELECTION
 # -------------------------
 def get_universe() -> List[str]:
-    chosen = []
+    chosen: List[str] = []
     try:
         assets = safe_api_call(api.list_assets, status="active")
     except Exception as e:
@@ -159,7 +159,7 @@ def get_universe() -> List[str]:
         sym = a.symbol
         try:
             bars = fetch_bars_with_backoff(sym, TimeFrame.Day, limit=2)
-            if bars is None or bars.empty:
+            if bars is None:
                 continue
             last_close = float(bars["close"].iloc[-1])
             last_vol = int(bars["volume"].iloc[-1])
@@ -190,13 +190,11 @@ def choose_atm_call_put(symbol: str):
         contracts = fetch_option_contracts_with_backoff(symbol)
         if not contracts:
             return None, None, None
-
         bars = fetch_bars_with_backoff(symbol, TimeFrame.Day, limit=1)
-        if bars is None or bars.empty:
+        if bars is None or getattr(bars, "empty", False):
             return None, None, None
         underlying_price = float(bars["close"].iloc[-1])
         today = datetime.now(timezone.utc).date()
-
         valid_contracts = []
         for c in contracts:
             try:
@@ -213,17 +211,14 @@ def choose_atm_call_put(symbol: str):
                 valid_contracts.append(c)
             except Exception:
                 continue
-
         if not valid_contracts:
             return None, None, underlying_price
-
         calls = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "call"]
-        puts = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "put"]
+        puts  = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "put"]
         if not calls or not puts:
             return None, None, underlying_price
-
         atm_call = min(calls, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
-        atm_put  = min(puts,  key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
+        atm_put  = min(puts, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
         return atm_call, atm_put, underlying_price
     except Exception as e:
         print(f"[OptionSelectError] {symbol}: {e}")
@@ -243,29 +238,24 @@ def trade_logic():
             print("[TradeLogic] No cash.")
             return
         max_invest = cash * RISK_PER_TRADE
-
         global symbols
         symbols = get_universe()
         if not symbols:
             print("[TradeLogic] No symbols selected.")
             return
-
         for sym in symbols:
             call, put, underlying_price = choose_atm_call_put(sym)
             if not call or not put:
                 print(f"[{sym}] No valid ATM options meeting filters.")
                 continue
-
             call_price = float(getattr(call, "ask_price", getattr(call, "last_trade_price", getattr(call, "last_price", 0))))
             put_price  = float(getattr(put,  "ask_price", getattr(put,  "last_trade_price", getattr(put,  "last_price", 0))))
             if call_price <= 0 or put_price <= 0:
-                print(f"[{sym}] invalid option price (call={call_price}, put={put_price}), skipping")
                 continue
-
-            call_qty = int(max_invest / (call_price * 100)) if call_price > 0 else 0
-            put_qty  = int(max_invest / (put_price * 100)) if put_price > 0 else 0
-
-            call_symbol = getattr(call, "symbol", None) or getattr(call, "contract", None)
+            call_qty = int(max_invest / (call_price * 100))
+            put_qty  = int(max_invest / (put_price * 100))
+            call_symbol = getattr(call, "symbol", getattr(call, "contract", None))
+            put_symbol  = getattr(put,  "symbol", getattr(put,  "contract", None))
             if call_qty >= 1 and call_symbol and call_symbol not in purchased_options:
                 try:
                     safe_api_call(api.submit_order, symbol=call_symbol, qty=call_qty, side="buy", type="market", time_in_force="day")
@@ -276,8 +266,6 @@ def trade_logic():
                 except Exception as e:
                     print(f"[OrderError] CALL {call_symbol}: {e}")
                     send_discord_message(f"❌ OrderError CALL {call_symbol}: {e}")
-
-            put_symbol = getattr(put, "symbol", None) or getattr(put, "contract", None)
             if put_qty >= 1 and put_symbol and put_symbol not in purchased_options:
                 try:
                     safe_api_call(api.submit_order, symbol=put_symbol, qty=put_qty, side="buy", type="market", time_in_force="day")
@@ -288,7 +276,6 @@ def trade_logic():
                 except Exception as e:
                     print(f"[OrderError] PUT {put_symbol}: {e}")
                     send_discord_message(f"❌ OrderError PUT {put_symbol}: {e}")
-
     except Exception as e:
         print(f"[TradeLogicError] {e}")
         send_critical_alert("Trade logic failure", e)
@@ -306,7 +293,6 @@ def manage_risk():
         print(f"[ManageRisk] Failed to list positions: {e}")
         send_critical_alert("Failed to list positions", e)
         return
-
     for pos in positions:
         try:
             if getattr(pos, "asset_class", "") != "option":
@@ -371,20 +357,14 @@ def schedule_jobs():
 # SIGNALS & EXCEPTIONS
 # -------------------------
 def handle_termination(signum, frame):
-    try:
-        send_critical_alert(f"Process received termination signal ({signum}). Shutting down gracefully.")
-    except Exception:
-        pass
+    send_critical_alert(f"Process received termination signal ({signum}). Shutting down gracefully.")
     print(f"[Signal] Received signal {signum}. Exiting.")
     sys.exit(0)
 
 def excepthook(type_, value, tb):
     trace = "".join(traceback.format_exception(type_, value, tb))
     print(f"[UncaughtException] {trace}")
-    try:
-        send_discord_message(f"🔥 Uncaught exception: {value}\n```{trace[-1800:]}```", critical=True)
-    except Exception:
-        pass
+    send_discord_message(f"🔥 Uncaught exception: {value}\n```{trace[-1800:]}```", critical=True)
     sys.exit(1)
 
 signal.signal(signal.SIGTERM, handle_termination)
@@ -399,7 +379,7 @@ if __name__ == "__main__":
     try:
         send_discord_message(f"🚀 Bot started at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}")
     except Exception:
-        print("[Startup] Discord start message failed")
+        print("[Startup] Discord start message failed (webhook missing or network)")
 
     schedule_jobs()
 
@@ -412,12 +392,9 @@ if __name__ == "__main__":
 
     try:
         while True:
-            try:
-                schedule.run_pending()
-            except Exception as loop_exc:
-                print(f"[SchedulerError] {loop_exc}")
-                send_critical_alert("Scheduler job raised exception", loop_exc)
+            schedule.run_pending()
             time.sleep(1)
     except Exception as final_exc:
         send_critical_alert("Fatal error in main loop", final_exc)
         raise
+
