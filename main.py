@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Dynamic Options Swing (Alpaca) - Paper Trading
+Dynamic Options Swing (Alpaca) - Paper trading default
  - Dynamic universe selection (price / volume filters)
  - ATM call/put selection with option-volume & price filters
- - Skip tickers with no bars or preferred share suffixes
- - Discord: heartbeats, trade updates, stop-loss, daily summary
- - Timezone-safe: all bar timestamps forced to UTC
+ - Exponential backoff for data calls, skip symbol after retries (no Discord alerts for data failures)
+ - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts on crashes
+ - Timezone-safe: all bar timestamps are forced to UTC to avoid offset-naive vs offset-aware issues
 """
 import os
 import sys
@@ -27,7 +27,6 @@ API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Universe & option filters
 RISK_PER_TRADE = 0.02
 STOP_LOSS_PCT = 0.35
 TOP_N_STOCKS = 10
@@ -38,12 +37,10 @@ MIN_OPTION_VOLUME = 50
 MIN_OPTION_PRICE = 0.50
 MIN_DAYS_TO_EXPIRY = 3
 
-# Retry / timing
 MAX_RETRIES = 3
 INITIAL_RETRY_SLEEP = 3
 TRADE_INTERVAL_MINUTES = 30
 
-# Scheduler times
 DAILY_REFRESH_TIME = "09:45"
 DAILY_TRADE_TIME = "09:50"
 DAILY_SUMMARY_TIME = "20:00"
@@ -75,14 +72,17 @@ def send_discord_message(message: str, critical: bool = False) -> None:
         print(f"[Discord] send error: {e}")
 
 def send_critical_alert(title: str, exc: Optional[BaseException] = None) -> None:
-    trace = ""
-    if exc:
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        trace = f"\n```{tb[-1800:]}```"
-    else:
-        tb = "".join(traceback.format_stack())
-        trace = f"\n```{tb[-1800:]}```"
-    send_discord_message(f"🔥 CRITICAL: {title} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}{trace}", critical=True)
+    try:
+        trace = ""
+        if exc:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            trace = f"\n```{tb[-1800:]}```"
+        else:
+            tb = "".join(traceback.format_stack())
+            trace = f"\n```{tb[-1800:]}```"
+        send_discord_message(f"🔥 CRITICAL: {title} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}{trace}", critical=True)
+    except Exception as e:
+        print(f"[CriticalAlertError] {e}")
 
 # -------------------------
 # SAFE API CALLS / BACKOFF
@@ -92,12 +92,20 @@ def safe_api_call(fn, *args, max_retries=MAX_RETRIES, initial_sleep=INITIAL_RETR
     for attempt in range(1, max_retries + 1):
         try:
             return fn(*args, **kwargs)
+        except APIError as e:
+            # Only retry for transient errors
+            if getattr(e, 'status_code', 0) in (429, 500, 502, 503, 504):
+                print(f"[Retry {attempt}/{max_retries}] transient API error: {e}")
+                time.sleep(sleep)
+                sleep *= 2
+            else:
+                print(f"[Skip] Non-retriable API error: {e}")
+                return None
         except Exception as e:
-            print(f"[Retry {attempt}/{max_retries}] {fn.__name__} failed: {e}")
-            if attempt == max_retries:
-                raise
-            time.sleep(sleep + attempt)
+            print(f"[Retry {attempt}/{max_retries}] Exception: {e}")
+            time.sleep(sleep)
             sleep *= 2
+    return None
 
 # -------------------------
 # MARKET STATUS / DATA HELPERS
@@ -112,29 +120,42 @@ def is_market_open() -> bool:
         print(f"[ClockError] {e}")
         return False
 
-
-def fetch_bars_safe(symbol, timeframe, limit=5):
-    import pandas as pd
+def _ensure_index_utc(df):
+    if df is None:
+        return df
     try:
-        bars = api.get_bars(symbol, timeframe, limit=limit)
-        df = getattr(bars, "df", bars)
-        if df is None or df.empty:
+        import pandas as pd
+        idx = pd.to_datetime(df.index)
+        if getattr(idx, "tz", None) is None:
+            df.index = idx.tz_localize('UTC')
+        else:
+            df.index = idx.tz_convert('UTC')
+    except Exception as e:
+        print(f"[TimezoneFix] {e}")
+    return df
+
+def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
+    try:
+        bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
+        if bars is None:
+            return None
+        df = getattr(bars, "df", None) or bars
+        if df is not None and hasattr(df, "index"):
+            df = _ensure_index_utc(df)
+        # skip empty DataFrame
+        import pandas as pd
+        if df is None or (hasattr(df, "empty") and df.empty):
             print(f"[DataFetch] {symbol} has no bars, skipping without retry")
             return None
-        df.index = pd.to_datetime(df.index)
-        if getattr(df.index, "tz", None) is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
         return df
     except Exception as e:
-        print(f"[DataFetch] Exception fetching {symbol} bars: {e}")
+        print(f"[DataFetch] Max retries exceeded for {symbol} bars: {e}")
         return None
-
 
 def fetch_option_contracts_with_backoff(symbol: str):
     try:
-        return safe_api_call(api.get_options_contracts, symbol)
+        contracts = safe_api_call(api.get_options_contracts, symbol)
+        return contracts
     except Exception as e:
         print(f"[DataFetch] Max retries exceeded for {symbol} option contracts: {e}")
         return None
@@ -146,6 +167,8 @@ def get_universe() -> List[str]:
     chosen: List[str] = []
     try:
         assets = safe_api_call(api.list_assets, status="active")
+        if not assets:
+            return []
     except Exception as e:
         print(f"[Universe] list_assets failed: {e}")
         send_critical_alert("Failed to list assets", e)
@@ -155,6 +178,9 @@ def get_universe() -> List[str]:
     candidates = []
     for a in tradable:
         sym = a.symbol
+        if any(x in sym for x in (".PRB", ".PRA", ".PRC", ".PRE", ".U")):
+            print(f"[Universe] Skipping preferred/security ticker {sym}")
+            continue
         try:
             bars = fetch_bars_with_backoff(sym, TimeFrame.Day, limit=2)
             if bars is None:
@@ -188,10 +214,12 @@ def choose_atm_call_put(symbol: str):
         contracts = fetch_option_contracts_with_backoff(symbol)
         if not contracts:
             return None, None, None
+
         bars = fetch_bars_with_backoff(symbol, TimeFrame.Day, limit=1)
-        if bars is None or getattr(bars, "empty", False):
+        if bars is None:
             return None, None, None
         underlying_price = float(bars["close"].iloc[-1])
+
         today = datetime.now(timezone.utc).date()
         valid_contracts = []
         for c in contracts:
@@ -209,14 +237,18 @@ def choose_atm_call_put(symbol: str):
                 valid_contracts.append(c)
             except Exception:
                 continue
+
         if not valid_contracts:
             return None, None, underlying_price
+
         calls = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "call"]
-        puts  = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "put"]
+        puts = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "put"]
         if not calls or not puts:
             return None, None, underlying_price
+
         atm_call = min(calls, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
-        atm_put  = min(puts, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
+        atm_put  = min(puts,  key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
+
         return atm_call, atm_put, underlying_price
     except Exception as e:
         print(f"[OptionSelectError] {symbol}: {e}")
@@ -231,29 +263,37 @@ def trade_logic():
         return
     try:
         account = safe_api_call(api.get_account)
+        if account is None:
+            return
         cash = float(account.cash)
         if cash <= 0:
             print("[TradeLogic] No cash.")
             return
         max_invest = cash * RISK_PER_TRADE
+
         global symbols
         symbols = get_universe()
         if not symbols:
             print("[TradeLogic] No symbols selected.")
             return
+
         for sym in symbols:
             call, put, underlying_price = choose_atm_call_put(sym)
             if not call or not put:
                 print(f"[{sym}] No valid ATM options meeting filters.")
                 continue
+
             call_price = float(getattr(call, "ask_price", getattr(call, "last_trade_price", getattr(call, "last_price", 0))))
             put_price  = float(getattr(put,  "ask_price", getattr(put,  "last_trade_price", getattr(put,  "last_price", 0))))
+
             if call_price <= 0 or put_price <= 0:
+                print(f"[{sym}] invalid option price (call={call_price}, put={put_price}), skipping")
                 continue
-            call_qty = int(max_invest / (call_price * 100))
-            put_qty  = int(max_invest / (put_price * 100))
-            call_symbol = getattr(call, "symbol", getattr(call, "contract", None))
-            put_symbol  = getattr(put,  "symbol", getattr(put,  "contract", None))
+
+            call_qty = int(max_invest / (call_price * 100)) if call_price > 0 else 0
+            put_qty  = int(max_invest / (put_price * 100)) if put_price > 0 else 0
+
+            call_symbol = getattr(call, "symbol", None) or getattr(call, "contract", None)
             if call_qty >= 1 and call_symbol and call_symbol not in purchased_options:
                 try:
                     safe_api_call(api.submit_order, symbol=call_symbol, qty=call_qty, side="buy", type="market", time_in_force="day")
@@ -264,6 +304,8 @@ def trade_logic():
                 except Exception as e:
                     print(f"[OrderError] CALL {call_symbol}: {e}")
                     send_discord_message(f"❌ OrderError CALL {call_symbol}: {e}")
+
+            put_symbol = getattr(put, "symbol", None) or getattr(put, "contract", None)
             if put_qty >= 1 and put_symbol and put_symbol not in purchased_options:
                 try:
                     safe_api_call(api.submit_order, symbol=put_symbol, qty=put_qty, side="buy", type="market", time_in_force="day")
@@ -274,6 +316,7 @@ def trade_logic():
                 except Exception as e:
                     print(f"[OrderError] PUT {put_symbol}: {e}")
                     send_discord_message(f"❌ OrderError PUT {put_symbol}: {e}")
+
     except Exception as e:
         print(f"[TradeLogicError] {e}")
         send_critical_alert("Trade logic failure", e)
@@ -287,10 +330,13 @@ def manage_risk():
         return
     try:
         positions = safe_api_call(api.list_positions)
+        if positions is None:
+            return
     except Exception as e:
         print(f"[ManageRisk] Failed to list positions: {e}")
         send_critical_alert("Failed to list positions", e)
         return
+
     for pos in positions:
         try:
             if getattr(pos, "asset_class", "") != "option":
@@ -331,6 +377,8 @@ def reset_daily_state():
 def send_heartbeat():
     try:
         account = safe_api_call(api.get_account)
+        if account is None:
+            return
         equity = float(account.equity)
         cash = float(account.cash)
         send_discord_message(f"💓 Bot alive at {datetime.now(timezone.utc):%H:%M UTC}. Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
@@ -355,14 +403,20 @@ def schedule_jobs():
 # SIGNALS & EXCEPTIONS
 # -------------------------
 def handle_termination(signum, frame):
-    send_critical_alert(f"Process received termination signal ({signum}). Shutting down gracefully.")
+    try:
+        send_critical_alert(f"Process received termination signal ({signum}). Shutting down gracefully.")
+    except Exception:
+        pass
     print(f"[Signal] Received signal {signum}. Exiting.")
     sys.exit(0)
 
 def excepthook(type_, value, tb):
     trace = "".join(traceback.format_exception(type_, value, tb))
     print(f"[UncaughtException] {trace}")
-    send_discord_message(f"🔥 Uncaught exception: {value}\n```{trace[-1800:]}```", critical=True)
+    try:
+        send_discord_message(f"🔥 Uncaught exception: {value}\n```{trace[-1800:]}```", critical=True)
+    except Exception:
+        pass
     sys.exit(1)
 
 signal.signal(signal.SIGTERM, handle_termination)
@@ -381,18 +435,9 @@ if __name__ == "__main__":
 
     schedule_jobs()
 
-    try:
-        trade_logic()
-        manage_risk()
-    except Exception as e:
-        print(f"[StartupError] {e}")
-        send_critical_alert("StartupError", e)
+    # run once immediately
+    trade_logic()
 
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-    except Exception as final_exc:
-        send_critical_alert("Fatal error in main loop", final_exc)
-        raise
-
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
