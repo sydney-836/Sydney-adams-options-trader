@@ -112,27 +112,25 @@ def is_market_open() -> bool:
         print(f"[ClockError] {e}")
         return False
 
-def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
+
+def fetch_bars_safe(symbol, timeframe, limit=5):
+    import pandas as pd
     try:
-        # Skip tickers with unusual suffixes like preferred shares
-        if "." in symbol and symbol.split(".")[1].startswith("P"):
-            print(f"[Universe] Skipping preferred/security ticker {symbol}")
-            return None
-        bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
+        bars = api.get_bars(symbol, timeframe, limit=limit)
         df = getattr(bars, "df", bars)
-        if df is None or getattr(df, "empty", True):
+        if df is None or df.empty:
             print(f"[DataFetch] {symbol} has no bars, skipping without retry")
             return None
-        import pandas as pd
         df.index = pd.to_datetime(df.index)
         if getattr(df.index, "tz", None) is None:
-            df.index = df.index.tz_localize('UTC')
+            df.index = df.index.tz_localize("UTC")
         else:
-            df.index = df.index.tz_convert('UTC')
+            df.index = df.index.tz_convert("UTC")
         return df
     except Exception as e:
-        print(f"[DataFetch] Max retries exceeded for {symbol} bars: {e}")
+        print(f"[DataFetch] Exception fetching {symbol} bars: {e}")
         return None
+
 
 def fetch_option_contracts_with_backoff(symbol: str):
     try:
