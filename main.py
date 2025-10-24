@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
 Dynamic Options Swing (Alpaca) - Paper Trading with Hardcoded Universe
- - Hardcoded top 30 tickers for testing ($3-$50, high option activity)
- - ATM call/put selection with option-volume & price filters
- - Exponential backoff for data calls, skip symbol after retries
- - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts
- - Timezone-safe: all bar timestamps are forced to UTC
+Fully integrated version: ATM option selection, trading, risk management, Discord notifications
 """
 import os
 import sys
 import time
 import traceback
-import signal
 import schedule
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Optional
 from alpaca_trade_api import REST, TimeFrame
-from alpaca_trade_api.rest import APIError
 
 # -------------------------
 # CONFIGURATION
@@ -29,7 +23,6 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 RISK_PER_TRADE = 0.02
 STOP_LOSS_PCT = 0.35
-TOP_N_STOCKS = 10  # not used in hardcoded mode
 MIN_PRICE = 3.0
 MAX_PRICE = 50.0
 MIN_VOLUME = 1_000_000
@@ -41,13 +34,7 @@ MAX_RETRIES = 3
 INITIAL_RETRY_SLEEP = 3
 TRADE_INTERVAL_MINUTES = 30
 
-DAILY_REFRESH_TIME = "09:45"
-DAILY_TRADE_TIME = "09:50"
-DAILY_SUMMARY_TIME = "20:00"
-
-# -------------------------
-# HARDCODED UNIVERSE
-# -------------------------
+# Hardcoded top 30 tickers for testing
 HARDCODED_TICKERS = [
     "AAPL", "MSFT", "AMD", "NVDA", "INTC", "TSLA", "COIN", "BA", "META", "NFLX",
     "BIDU", "F", "GM", "ZM", "PLTR", "UBER", "LYFT", "SQ", "PYPL", "PFE",
@@ -62,7 +49,6 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # -------------------------
 # STATE
 # -------------------------
-symbols: List[str] = []
 purchased_options = set()
 
 # -------------------------
@@ -105,7 +91,7 @@ def safe_api_call(fn, *args, max_retries=MAX_RETRIES, initial_sleep=INITIAL_RETR
             print(f"[Retry {attempt}/{max_retries}] {fn.__name__} failed: {e}")
             if attempt == max_retries:
                 raise
-            time.sleep(sleep + attempt)
+            time.sleep(sleep)
             sleep *= 2
 
 # -------------------------
@@ -116,12 +102,10 @@ def is_market_open() -> bool:
         clock = safe_api_call(api.get_clock)
         return getattr(clock, "is_open", False)
     except Exception as e:
-        if "401" in str(e):
-            send_critical_alert("401 Unauthorized from Alpaca during get_clock()", e)
         print(f"[ClockError] {e}")
         return False
 
-def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
+def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5):
     try:
         bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
         df = getattr(bars, "df", None) or bars
@@ -133,67 +117,108 @@ def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -
         print(f"[DataFetch] Max retries exceeded for {symbol} bars: {e}")
         return None
 
+# -------------------------
+# OPTIONS API
+# -------------------------
 def fetch_option_contracts_with_backoff(symbol: str):
-    try:
-        contracts = safe_api_call(api.get_options_contracts, symbol)
-        return contracts
-    except Exception as e:
-        print(f"[DataFetch] Max retries exceeded for {symbol} option contracts: {e}")
-        return None
+    BASE_URL_OPTS = "https://paper-api.alpaca.markets/v2/options/contracts"
+    headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
+    params = {"symbol": symbol, "limit": 50}
 
-# -------------------------
-# UNIVERSE SELECTION
-# -------------------------
-def get_universe() -> List[str]:
-    chosen = HARDCODED_TICKERS
-    print(f"[Universe] Using hardcoded universe: {chosen}")
-    send_discord_message(f"📈 Universe updated (hardcoded): {chosen}")
-    return chosen
+    sleep = INITIAL_RETRY_SLEEP
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(BASE_URL_OPTS, headers=headers, params=params, timeout=6)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            return data
+        except Exception as e:
+            print(f"[Retry {attempt}/{MAX_RETRIES}] Failed fetching {symbol} options: {e}")
+            if attempt == MAX_RETRIES:
+                return None
+            time.sleep(sleep)
+            sleep *= 2
+    return None
 
-# -------------------------
-# OPTION SELECTION (ATM)
-# -------------------------
 def choose_atm_call_put(symbol: str):
     try:
         contracts = fetch_option_contracts_with_backoff(symbol)
         if not contracts:
             return None, None, None
+
         bars = fetch_bars_with_backoff(symbol, TimeFrame.Day, limit=1)
         if bars is None or getattr(bars, "empty", False):
             return None, None, None
+
         underlying_price = float(bars["close"].iloc[-1])
         today = datetime.now(timezone.utc).date()
         valid_contracts = []
+
         for c in contracts:
             try:
-                exp_str = getattr(c, "expiration_date", None) or getattr(c, "expiration", None)
-                if not exp_str:
+                exp_date_str = c.get("expiration_date")
+                if not exp_date_str:
                     continue
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                exp_date = datetime.strptime(exp_date_str, "%Y-%m-%d").date()
                 if (exp_date - today).days < MIN_DAYS_TO_EXPIRY:
                     continue
-                vol = int(getattr(c, "volume", 0) or 0)
-                last_price = getattr(c, "last_trade_price", None) or getattr(c, "ask_price", None) or getattr(c, "last_price", None)
-                if last_price is None:
-                    continue
-                last_price = float(last_price)
+
+                vol = int(c.get("volume") or 0)
+                last_price = float(c.get("last_trade_price") or c.get("ask_price") or 0)
                 if last_price < MIN_OPTION_PRICE or vol < MIN_OPTION_VOLUME:
                     continue
                 valid_contracts.append(c)
             except Exception:
                 continue
+
         if not valid_contracts:
             return None, None, underlying_price
-        calls = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "call"]
-        puts = [c for c in valid_contracts if getattr(c, "option_type", "").lower() == "put"]
+
+        calls = [c for c in valid_contracts if c.get("option_type", "").lower() == "call"]
+        puts  = [c for c in valid_contracts if c.get("option_type", "").lower() == "put"]
+
         if not calls or not puts:
             return None, None, underlying_price
-        atm_call = min(calls, key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
-        atm_put  = min(puts,  key=lambda x: abs(float(getattr(x, "strike_price", getattr(x, "strike", 0))) - underlying_price))
+
+        atm_call = min(calls, key=lambda x: abs(float(x.get("strike_price", 0)) - underlying_price))
+        atm_put  = min(puts,  key=lambda x: abs(float(x.get("strike_price", 0)) - underlying_price))
+
         return atm_call, atm_put, underlying_price
     except Exception as e:
         print(f"[OptionSelectError] {symbol}: {e}")
         return None, None, None
+
+# -------------------------
+# ORDER SUBMISSION
+# -------------------------
+def submit_option_order(contract: dict, max_invest: float, purchased_options: set, side: str):
+    try:
+        symbol = contract.get("symbol")
+        last_price = float(contract.get("ask_price") or contract.get("last_trade_price") or 0)
+        if not symbol or last_price <= 0:
+            print(f"[OrderSkip] Invalid symbol or price: {symbol}, {last_price}")
+            return
+
+        qty = int(max_invest / (last_price * 100))
+        if qty < 1 or symbol in purchased_options:
+            return
+
+        safe_api_call(
+            api.submit_order,
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type="market",
+            time_in_force="day"
+        )
+        purchased_options.add(symbol)
+        action = "🟢 Bought" if side == "buy" else "🔴 Sold"
+        msg = f"{action} {symbol} x{qty} @ ~${last_price:.2f}"
+        print(f"[TRADE] {msg}")
+        send_discord_message(msg)
+    except Exception as e:
+        print(f"[OrderError] {symbol}: {e}")
+        send_discord_message(f"❌ OrderError {symbol}: {e}")
 
 # -------------------------
 # TRADING LOGIC
@@ -209,45 +234,16 @@ def trade_logic():
             print("[TradeLogic] No cash.")
             return
         max_invest = cash * RISK_PER_TRADE
-        global symbols
-        symbols = get_universe()
-        if not symbols:
-            print("[TradeLogic] No symbols selected.")
-            return
-        for sym in symbols:
+
+        for sym in HARDCODED_TICKERS:
             call, put, underlying_price = choose_atm_call_put(sym)
             if not call or not put:
                 print(f"[{sym}] No valid ATM options meeting filters.")
                 continue
-            call_price = float(getattr(call, "ask_price", getattr(call, "last_trade_price", getattr(call, "last_price", 0))))
-            put_price  = float(getattr(put,  "ask_price", getattr(put,  "last_trade_price", getattr(put,  "last_price", 0))))
-            if call_price <= 0 or put_price <= 0:
-                print(f"[{sym}] invalid option price, skipping")
-                continue
-            call_qty = int(max_invest / (call_price * 100)) if call_price > 0 else 0
-            put_qty  = int(max_invest / (put_price * 100)) if put_price > 0 else 0
-            call_symbol = getattr(call, "symbol", None) or getattr(call, "contract", None)
-            if call_qty >= 1 and call_symbol and call_symbol not in purchased_options:
-                try:
-                    safe_api_call(api.submit_order, symbol=call_symbol, qty=call_qty, side="buy", type="market", time_in_force="day")
-                    purchased_options.add(call_symbol)
-                    msg = f"🟢 Bought CALL {call_symbol} x{call_qty} at ~${call_price:.2f} (underlying {sym} @ ${underlying_price:.2f})"
-                    print(f"[TRADE] {msg}")
-                    send_discord_message(msg)
-                except Exception as e:
-                    print(f"[OrderError] CALL {call_symbol}: {e}")
-                    send_discord_message(f"❌ OrderError CALL {call_symbol}: {e}")
-            put_symbol = getattr(put, "symbol", None) or getattr(put, "contract", None)
-            if put_qty >= 1 and put_symbol and put_symbol not in purchased_options:
-                try:
-                    safe_api_call(api.submit_order, symbol=put_symbol, qty=put_qty, side="buy", type="market", time_in_force="day")
-                    purchased_options.add(put_symbol)
-                    msg = f"🔴 Bought PUT {put_symbol} x{put_qty} at ~${put_price:.2f} (underlying {sym} @ ${underlying_price:.2f})"
-                    print(f"[TRADE] {msg}")
-                    send_discord_message(msg)
-                except Exception as e:
-                    print(f"[OrderError] PUT {put_symbol}: {e}")
-                    send_discord_message(f"❌ OrderError PUT {put_symbol}: {e}")
+
+            submit_option_order(call, max_invest, purchased_options, side="buy")
+            submit_option_order(put,  max_invest, purchased_options, side="buy")
+
     except Exception as e:
         print(f"[TradeLogicError] {e}")
         send_critical_alert("Trade logic failure", e)
@@ -265,6 +261,7 @@ def manage_risk():
         print(f"[ManageRisk] Failed to list positions: {e}")
         send_critical_alert("Failed to list positions", e)
         return
+
     for pos in positions:
         try:
             if getattr(pos, "asset_class", "") != "option":
@@ -273,15 +270,30 @@ def manage_risk():
             qty = int(abs(float(pos.qty)))
             entry_price = float(pos.avg_entry_price)
             current_price = float(pos.current_price)
-            if current_price < entry_price * (1 - STOP_LOSS_PCT):
-                safe_api_call(api.submit_order, symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
-                print(f"[STOP-LOSS] Sold {symbol} at {current_price:.2f}")
-                send_discord_message(f"⚠️ STOP-LOSS triggered: Sold {symbol} at ${current_price:.2f}")
+            loss_pct = (entry_price - current_price) / entry_price
+
+            if loss_pct >= STOP_LOSS_PCT:
+                safe_api_call(
+                    api.submit_order,
+                    symbol=symbol,
+                    qty=qty,
+                    side="sell",
+                    type="market",
+                    time_in_force="day"
+                )
+                print(f"[STOP-LOSS] Sold {symbol} at {current_price:.2f} (loss {loss_pct*100:.1f}%)")
+                send_discord_message(
+                    f"⚠️ STOP-LOSS triggered: Sold {symbol} x{qty} at ${current_price:.2f} "
+                    f"(loss {loss_pct*100:.1f}%)"
+                )
+            else:
+                print(f"[Risk] {symbol} is safe: current {current_price:.2f}, entry {entry_price:.2f}")
+
         except Exception as e:
             print(f"[RiskError] {pos.symbol}: {e}")
 
 # -------------------------
-# SCHEDULE
+# SCHEDULER
 # -------------------------
 schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(trade_logic)
 schedule.every(TRADE_INTERVAL_MINUTES).minutes.do(manage_risk)
