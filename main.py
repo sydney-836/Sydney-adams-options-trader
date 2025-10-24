@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Dynamic Options Swing (Alpaca) - Paper trading default
+Dynamic Options Swing (Alpaca) - Fixed Full Version (Paper trading default)
  - Dynamic universe selection (price / volume filters)
  - ATM call/put selection with option-volume & price filters
- - Exponential backoff for data calls, skip symbol after retries (no Discord alerts for data failures)
+ - Exponential backoff for data calls, skip symbol after retries (no discord alerts for data failures)
  - Discord: heartbeats, trade updates, stop-loss, daily summary, critical alerts on crashes
  - Timezone-safe: all bar timestamps are forced to UTC to avoid offset-naive vs offset-aware issues
+ - Fixed DataFrame boolean checks to prevent ambiguous truth value errors
 """
 import os
 import sys
@@ -14,7 +15,7 @@ import traceback
 import signal
 import schedule
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Optional
 from alpaca_trade_api import REST, TimeFrame
 from alpaca_trade_api.rest import APIError
@@ -92,20 +93,12 @@ def safe_api_call(fn, *args, max_retries=MAX_RETRIES, initial_sleep=INITIAL_RETR
     for attempt in range(1, max_retries + 1):
         try:
             return fn(*args, **kwargs)
-        except APIError as e:
-            # Only retry for transient errors
-            if getattr(e, 'status_code', 0) in (429, 500, 502, 503, 504):
-                print(f"[Retry {attempt}/{max_retries}] transient API error: {e}")
-                time.sleep(sleep)
-                sleep *= 2
-            else:
-                print(f"[Skip] Non-retriable API error: {e}")
-                return None
         except Exception as e:
-            print(f"[Retry {attempt}/{max_retries}] Exception: {e}")
-            time.sleep(sleep)
+            print(f"[Retry {attempt}/{max_retries}] {fn.__name__} failed: {e}")
+            if attempt == max_retries:
+                raise
+            time.sleep(sleep + attempt)
             sleep *= 2
-    return None
 
 # -------------------------
 # MARKET STATUS / DATA HELPERS
@@ -121,30 +114,36 @@ def is_market_open() -> bool:
         return False
 
 def _ensure_index_utc(df):
-    if df is None:
-        return df
     try:
-        import pandas as pd
-        idx = pd.to_datetime(df.index)
-        if getattr(idx, "tz", None) is None:
-            df.index = idx.tz_localize('UTC')
-        else:
-            df.index = idx.tz_convert('UTC')
+        if df is None or not hasattr(df, "index"):
+            return df
+        idx = df.index
+        try:
+            if getattr(idx, "tz", None) is None:
+                df.index = idx.tz_localize('UTC')
+            else:
+                df.index = idx.tz_convert('UTC')
+        except Exception as e:
+            import pandas as pd
+            try:
+                df.index = pd.to_datetime(df.index).tz_localize('UTC')
+            except Exception:
+                print(f"[TimezoneFix] Could not enforce tz on df.index: {e}")
     except Exception as e:
-        print(f"[TimezoneFix] {e}")
+        print(f"[TimezoneFixGeneral] {e}")
     return df
 
-def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5) -> Optional[object]:
+def fetch_bars_with_backoff(symbol: str, timeframe: TimeFrame, limit: int = 5):
     try:
         bars = safe_api_call(api.get_bars, symbol, timeframe, limit=limit)
         if bars is None:
             return None
         df = getattr(bars, "df", None) or bars
-        if df is not None and hasattr(df, "index"):
-            df = _ensure_index_utc(df)
-        # skip empty DataFrame
+        if df is None:
+            return None
+        df = _ensure_index_utc(df)
         import pandas as pd
-        if df is None or (hasattr(df, "empty") and df.empty):
+        if isinstance(df, pd.DataFrame) and df.empty:
             print(f"[DataFetch] {symbol} has no bars, skipping without retry")
             return None
         return df
@@ -167,8 +166,6 @@ def get_universe() -> List[str]:
     chosen: List[str] = []
     try:
         assets = safe_api_call(api.list_assets, status="active")
-        if not assets:
-            return []
     except Exception as e:
         print(f"[Universe] list_assets failed: {e}")
         send_critical_alert("Failed to list assets", e)
@@ -178,9 +175,6 @@ def get_universe() -> List[str]:
     candidates = []
     for a in tradable:
         sym = a.symbol
-        if any(x in sym for x in (".PRB", ".PRA", ".PRC", ".PRE", ".U")):
-            print(f"[Universe] Skipping preferred/security ticker {sym}")
-            continue
         try:
             bars = fetch_bars_with_backoff(sym, TimeFrame.Day, limit=2)
             if bars is None:
@@ -232,7 +226,10 @@ def choose_atm_call_put(symbol: str):
                     continue
                 vol = int(getattr(c, "volume", 0) or 0)
                 last_price = getattr(c, "last_trade_price", None) or getattr(c, "ask_price", None) or getattr(c, "last_price", None)
-                if last_price is None or last_price < MIN_OPTION_PRICE or vol < MIN_OPTION_VOLUME:
+                if last_price is None:
+                    continue
+                last_price = float(last_price)
+                if last_price < MIN_OPTION_PRICE or vol < MIN_OPTION_VOLUME:
                     continue
                 valid_contracts.append(c)
             except Exception:
@@ -261,10 +258,9 @@ def trade_logic():
     if not is_market_open():
         print("[MarketClosed] Skipping trade logic")
         return
+
     try:
         account = safe_api_call(api.get_account)
-        if account is None:
-            return
         cash = float(account.cash)
         if cash <= 0:
             print("[TradeLogic] No cash.")
@@ -330,8 +326,6 @@ def manage_risk():
         return
     try:
         positions = safe_api_call(api.list_positions)
-        if positions is None:
-            return
     except Exception as e:
         print(f"[ManageRisk] Failed to list positions: {e}")
         send_critical_alert("Failed to list positions", e)
@@ -377,8 +371,6 @@ def reset_daily_state():
 def send_heartbeat():
     try:
         account = safe_api_call(api.get_account)
-        if account is None:
-            return
         equity = float(account.equity)
         cash = float(account.cash)
         send_discord_message(f"💓 Bot alive at {datetime.now(timezone.utc):%H:%M UTC}. Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
@@ -400,44 +392,21 @@ def schedule_jobs():
     schedule.every(3).hours.do(send_heartbeat)
 
 # -------------------------
-# SIGNALS & EXCEPTIONS
-# -------------------------
-def handle_termination(signum, frame):
-    try:
-        send_critical_alert(f"Process received termination signal ({signum}). Shutting down gracefully.")
-    except Exception:
-        pass
-    print(f"[Signal] Received signal {signum}. Exiting.")
-    sys.exit(0)
-
-def excepthook(type_, value, tb):
-    trace = "".join(traceback.format_exception(type_, value, tb))
-    print(f"[UncaughtException] {trace}")
-    try:
-        send_discord_message(f"🔥 Uncaught exception: {value}\n```{trace[-1800:]}```", critical=True)
-    except Exception:
-        pass
-    sys.exit(1)
-
-signal.signal(signal.SIGTERM, handle_termination)
-signal.signal(signal.SIGINT, handle_termination)
-sys.excepthook = excepthook
-
-# -------------------------
 # MAIN
 # -------------------------
-if __name__ == "__main__":
-    print("🚀 Dynamic Options Swing (Alpaca) started", datetime.now(timezone.utc).isoformat())
-    try:
-        send_discord_message(f"🚀 Bot started at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}")
-    except Exception:
-        print("[Startup] Discord start message failed (webhook missing or network)")
-
+def main():
+    print(f"==> Dynamic Options Swing (Alpaca) starting at {datetime.now(timezone.utc)}")
     schedule_jobs()
-
-    # run once immediately
-    trade_logic()
-
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        try:
+            schedule.run_pending()
+            time.sleep(10)
+        except KeyboardInterrupt:
+            print("==> Exiting (KeyboardInterrupt)")
+            sys.exit(0)
+        except Exception as e:
+            send_critical_alert("Main loop crashed", e)
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()
